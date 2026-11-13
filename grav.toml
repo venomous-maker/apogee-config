@@ -1,0 +1,5 @@
+name = "apogee-config"
+lib = "src/all.grav"
+paths = ["src"]
+
+[dependencies]
