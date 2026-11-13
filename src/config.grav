@@ -1,0 +1,328 @@
+// config.grav — Config: the application's settings as one tree of plain values,
+// read by dotted path ("database.connections.main.host").
+//
+//   Config.loadDir("config")                        // config/app.json -> "app.*", ...
+//   Config.set("app.name", "Shop")
+//   Config.getString("app.name")                    // "Shop"
+//   Config.getInt("cache.ttl", 300)
+//   let db = Config.section::<DatabaseConfig>("database")   // typed: fields filled by name
+//
+// Values are what JSON holds: null, bool, long, double, string,
+// Array<any> and HashMap<string, any>. A JSON string that is exactly one
+// "${NAME}" or "${NAME:-default}" placeholder takes the environment variable's
+// value, typed (true/false, a number, else text); one inside longer text is
+// replaced as text.
+//
+// Every path is kept in a flat index, so a read is one hash lookup whatever its
+// depth, and reads never write: settings are made at boot, then read from any
+// number of request threads at once.
+import "std"
+import "env.grav"
+
+namespace apogee {
+
+    class ConfigRepository {
+        // The tree (top-level keys to values; maps nest).
+        private tree: HashMap<string, any>
+        // Every path, leaf or map, to its value: "a", "a.b", "a.b.c".
+        private flat: HashMap<string, any>
+
+        constructor() { self.tree = new HashMap<string, any>(); self.flat = new HashMap<string, any>(); }
+        // Starts from a map of settings (copied).
+        constructor(values: HashMap<string, any>) {
+            self.tree = new HashMap<string, any>();
+            self.flat = new HashMap<string, any>();
+            values.forEach(fn(k: string, v: any) { self.set(k, v); });
+        }
+
+        // ── reading ────────────────────────────────────────────────────────────
+        fn has(path: string) -> bool { return self.flat.containsKey(path); }
+        fn get(path: string, fallback: any = null) -> any {
+            if (!self.flat.containsKey(path)) { return fallback; }
+            return self.flat[path];
+        }
+        fn getString(path: string, fallback: string = "") -> string {
+            let v = self.get(path);
+            if (v == null) { return fallback; }
+            if (v is string) { return v as string; }
+            return str(v);
+        }
+        fn getInt(path: string, fallback: long = 0) -> long {
+            let v = self.get(path);
+            if (v is long) { return v as long; }
+            if (v is int) { return (v as int) as long; }
+            if (v is double) { return (v as double) as long; }
+            if (v is string) { return Integer.parseOr(Str.trim(v as string), fallback); }
+            if (v is bool) { return (v as bool) ? 1 : 0; }
+            return fallback;
+        }
+        fn getFloat(path: string, fallback: double = 0.0) -> double {
+            let v = self.get(path);
+            if (v is double) { return v as double; }
+            if (v is long) { return (v as long) as double; }
+            if (v is int) { return (v as int) as double; }
+            if (v is string) { return Format.toFloatOr(Str.trim(v as string), fallback); }
+            return fallback;
+        }
+        fn getBool(path: string, fallback: bool = false) -> bool {
+            let v = self.get(path);
+            if (v is bool) { return v as bool; }
+            if (v is long) { return (v as long) != 0; }
+            if (v is string) { return Env.truth(v as string, fallback); }
+            return fallback;
+        }
+        // A list setting: an array as text items, or a comma-separated string split.
+        fn getList(path: string) -> Array<string> {
+            let out = new Array<string>();
+            let v = self.get(path);
+            if (v is Array<any>) { for (x in v as Array<any>) { out.push(x is string ? x as string : str(x)); } }
+            else if (v is string) { for (p in Str.split(v as string, ",")) { let t = Str.trim(p); if (t != "") { out.push(t); } } }
+            return out;
+        }
+        // A map setting (an empty map when there is none).
+        fn getMap(path: string) -> HashMap<string, any> {
+            let v = self.get(path);
+            return v is HashMap<string, any> ? v as HashMap<string, any> : new HashMap<string, any>();
+        }
+        // ConfigError naming every one of `paths` that has no value.
+        fn require(paths: Array<string>) {
+            let missing = new Array<string>();
+            for (p in paths) { let v = self.get(p); if (v == null || (v is string && v as string == "")) { missing.push(p); } }
+            if (missing.size() > 0) { throw new ConfigError("missing configuration: " + Str.join(missing, ", ")); }
+        }
+        // The whole tree (the live maps: change settings through set()).
+        fn all() -> HashMap<string, any> { return self.tree; }
+        // Every leaf path and its value, sorted by path.
+        fn leaves() -> Array<Pair<string, any>> {
+            let names = new Array<string>();
+            self.flat.forEach(fn(k: string, v: any) { if (!(v is HashMap<string, any>)) { names.push(k); } });
+            Sort.sort(names);
+            let out = new Array<Pair<string, any>>();
+            for (k in names) { out.push(new Pair<string, any>(k, self.flat[k])); }
+            return out;
+        }
+
+        // ── typed sections ─────────────────────────────────────────────────────
+        // A new T (no-argument constructor) whose fields are set from the map at
+        // `path`: each field from the key of its own name, or its snake_case
+        // spelling ("maxConnections" from "max_connections"), converted to the
+        // field's type; fields with no key keep their defaults.
+        fn section<T>(path: string) -> T {
+            let info = reflect(T);
+            let obj = info.create() as T;
+            let m = self.getMap(path);
+            for (f in info.fields()) {
+                if (f.isReadonly() || f.isPrivate() || !f.canSet()) { continue; }
+                let key = m.containsKey(f.name) ? f.name : ConfigRepository.snake(f.name);
+                if (!m.containsKey(key)) { continue; }
+                try { f.set(obj, m[key]); }
+                catch (e: ValueError) { throw new ConfigError("${path}.${key}: ${e.message()}"); }
+            }
+            return obj;
+        }
+        static fn snake(name: string) -> string {
+            let sb = new StringBuilder();
+            for (i in 0..name.length) {
+                let c = name[i] as int;
+                if (c >= 65 && c <= 90) { if (i > 0) { sb.appendChar(95); } sb.appendChar(c + 32); }
+                else { sb.appendChar(c); }
+            }
+            return sb.toString();
+        }
+
+        // ── writing ────────────────────────────────────────────────────────────
+        // Sets `path` (making the maps along it), replacing what was there.
+        fn set(path: string, value: any) {
+            let parts = Str.split(path, ".");
+            let node = self.tree;
+            let prefix = "";
+            for (i in 0..(parts.size() - 1)) {
+                let k = parts[i];
+                prefix = i == 0 ? k : prefix + "." + k;
+                let next = node.getOr(k, null);
+                if (!(next is HashMap<string, any>)) {
+                    if (next != null) { self.unindex(prefix); }
+                    let fresh = new HashMap<string, any>();
+                    node.put(k, fresh);
+                    self.flat.put(prefix, fresh);
+                    node = fresh;
+                } else {
+                    node = next as HashMap<string, any>;
+                }
+            }
+            let last = parts[parts.size() - 1];
+            if (node.containsKey(last)) { self.unindex(path); }
+            let v = ConfigRepository.plain(value);
+            node.put(last, v);
+            self.index(path, v);
+        }
+        // Several settings at once (each key a path).
+        fn setMany(values: HashMap<string, any>) { values.forEach(fn(k: string, v: any) { self.set(k, v); }); }
+        // Merges `values` into the map at `path`, deeply: a key holding a map in
+        // both is merged in turn; anything else in `values` wins.
+        fn merge(path: string, values: HashMap<string, any>) {
+            values.forEach(fn(k: string, v: any) {
+                let p = path == "" ? k : path + "." + k;
+                if (v is HashMap<string, any> && self.get(p) is HashMap<string, any>) { self.merge(p, v as HashMap<string, any>); }
+                else { self.set(p, v); }
+            });
+        }
+        // Appends to the list at `path` (making it).
+        fn push(path: string, value: any) {
+            let cur = self.get(path);
+            let list = cur is Array<any> ? cur as Array<any> : new Array<any>();
+            list.push(ConfigRepository.plain(value));
+            if (!(cur is Array<any>)) { self.set(path, list); }
+        }
+        // Removes `path` and everything under it.
+        fn forget(path: string) {
+            let dot = Str.lastIndexOf(path, ".");
+            let parent = dot < 0 ? self.tree : self.get(path[..dot]);
+            if (!(parent is HashMap<string, any>)) { return; }
+            let key = dot < 0 ? path : path[dot + 1..];
+            if (!(parent as HashMap<string, any>).containsKey(key)) { return; }
+            (parent as HashMap<string, any>).remove(key);
+            self.unindex(path);
+        }
+
+        // ── loading ────────────────────────────────────────────────────────────
+        // A JSON file's object merged in at `path` ("" for the top level).
+        fn loadJson(file: string, path: string = "") {
+            let f = new File(file);
+            if (!f.exists()) { throw new ConfigError("no config file " + file); }
+            let j: JsonValue = null;
+            try { j = Json.parse(f.readOr("")); }
+            catch (e: Exception) { throw new ConfigError(file + ": not valid JSON (" + e.message() + ")"); }
+            let v = ConfigRepository.fromJson(j);
+            if (!(v is HashMap<string, any>)) { throw new ConfigError(file + ": the top level must be an object"); }
+            self.merge(path, v as HashMap<string, any>);
+        }
+        // Every `<name>.json` in `dir` under the key `<name>` (config/app.json is
+        // "app.*"), in name order; how many files it read.
+        fn loadDir(dir: string) -> int {
+            if (!Dir.exists(dir)) { return 0; }
+            let names = Dir.list(dir);
+            Sort.sort(names);
+            let n = 0;
+            for (name in names) {
+                if (!Str.endsWith(name, ".json")) { continue; }
+                self.loadJson(dir + "/" + name, name[..name.length - 5]);
+                n += 1;
+            }
+            return n;
+        }
+        // The tree as JSON text (for `config:show`, or a cache file loadJson reads back).
+        fn toJson() -> string { return ConfigRepository.toJsonValue(self.tree).toJson(); }
+
+        // ── the index ──────────────────────────────────────────────────────────
+        private fn index(path: string, v: any) {
+            self.flat.put(path, v);
+            if (v is HashMap<string, any>) {
+                (v as HashMap<string, any>).forEach(fn(k: string, x: any) { self.index(path + "." + k, x); });
+            }
+        }
+        private fn unindex(path: string) {
+            let v = self.flat.getOr(path, null);
+            self.flat.remove(path);
+            if (v is HashMap<string, any>) {
+                (v as HashMap<string, any>).forEach(fn(k: string, x: any) { self.unindex(path + "." + k); });
+            }
+        }
+
+        // ── plain values ───────────────────────────────────────────────────────
+        // A copy of `v` as config holds it: maps and arrays copied deeply (so a
+        // later change to the caller's map does not slip past the index).
+        static fn plain(v: any) -> any {
+            if (v is HashMap<string, any>) {
+                let out = new HashMap<string, any>();
+                (v as HashMap<string, any>).forEach(fn(k: string, x: any) { out.put(k, ConfigRepository.plain(x)); });
+                return out;
+            }
+            if (v is Array<any>) {
+                let out = new Array<any>();
+                for (x in v as Array<any>) { out.push(ConfigRepository.plain(x)); }
+                return out;
+            }
+            if (v is int) { return (v as int) as long; }
+            if (v is JsonValue) { return ConfigRepository.fromJson(v as JsonValue); }
+            return v;
+        }
+        static fn fromJson(j: JsonValue) -> any {
+            if (j == null || j.isNull()) { return null; }
+            if (j.isBool()) { return j.asBool(); }
+            if (j.isInteger()) { return j.asLong(); }
+            if (j.isNumber()) { return j.asFloat(); }
+            if (j.isString()) { return ConfigRepository.placeholder(j.asString()); }
+            if (j.isArray()) {
+                let out = new Array<any>();
+                for (x in j.asArray()) { out.push(ConfigRepository.fromJson(x)); }
+                return out;
+            }
+            let out = new HashMap<string, any>();
+            for (k in j.keys()) { out.put(k, ConfigRepository.fromJson(j.get(k))); }
+            return out;
+        }
+        // "${NAME}" alone: the variable's value, typed; inside other text: expanded.
+        static fn placeholder(s: string) -> any {
+            if (Str.indexOf(s, "\${") < 0) { return s; }
+            let whole = Str.startsWith(s, "\${") && Str.endsWith(s, "}") && Str.indexOf(s[2..], "\${") < 0;
+            let text = Env.expand(s, new HashMap<string, string>());
+            if (!whole) { return text; }
+            let t = Str.lower(Str.trim(text));
+            if (t == "true" || t == "(true)") { return true; }
+            if (t == "false" || t == "(false)") { return false; }
+            if (t == "null" || t == "(null)") { return null; }
+            if (text != "" && Format.toIntOr(text, -1) as long == Integer.parseOr(text, -2)) { return Integer.parseOr(text, 0); }
+            let f = Format.toFloatOr(text, 0.5);
+            if (text != "" && (f != 0.5 || text == "0.5")) { return f; }
+            return text;
+        }
+        static fn toJsonValue(v: any) -> JsonValue {
+            if (v == null) { return Json.nil(); }
+            if (v is bool) { return Json.of(v as bool); }
+            if (v is long) { return Json.of(v as long); }
+            if (v is double) { return Json.of(v as double); }
+            if (v is string) { return Json.of(v as string); }
+            if (v is Array<any>) {
+                let a = Json.array();
+                for (x in v as Array<any>) { a.push(ConfigRepository.toJsonValue(x)); }
+                return a;
+            }
+            if (v is HashMap<string, any>) {
+                let o = Json.object();
+                let keys = (v as HashMap<string, any>).keys();
+                Sort.sort(keys);
+                for (k in keys) { o.set(k, ConfigRepository.toJsonValue((v as HashMap<string, any>)[k])); }
+                return o;
+            }
+            return Json.of(str(v));
+        }
+    }
+
+    // The application's configuration (one ConfigRepository; see the top of
+    // this file). Swap it with Config.use(repo), say for a test.
+    class Config {
+        private static repo: ConfigRepository = new ConfigRepository()
+
+        static fn repository() -> ConfigRepository { return Config.repo; }
+        static fn use(repo: ConfigRepository) { Config.repo = repo; }
+        static fn reset() { Config.repo = new ConfigRepository(); }
+
+        static fn has(path: string) -> bool { return Config.repo.has(path); }
+        static fn get(path: string, fallback: any = null) -> any { return Config.repo.get(path, fallback); }
+        static fn getString(path: string, fallback: string = "") -> string { return Config.repo.getString(path, fallback); }
+        static fn getInt(path: string, fallback: long = 0) -> long { return Config.repo.getInt(path, fallback); }
+        static fn getFloat(path: string, fallback: double = 0.0) -> double { return Config.repo.getFloat(path, fallback); }
+        static fn getBool(path: string, fallback: bool = false) -> bool { return Config.repo.getBool(path, fallback); }
+        static fn getList(path: string) -> Array<string> { return Config.repo.getList(path); }
+        static fn getMap(path: string) -> HashMap<string, any> { return Config.repo.getMap(path); }
+        static fn section<T>(path: string) -> T { return Config.repo.section::<T>(path); }
+        static fn require(paths: Array<string>) { Config.repo.require(paths); }
+        static fn set(path: string, value: any) { Config.repo.set(path, value); }
+        static fn merge(path: string, values: HashMap<string, any>) { Config.repo.merge(path, values); }
+        static fn push(path: string, value: any) { Config.repo.push(path, value); }
+        static fn forget(path: string) { Config.repo.forget(path); }
+        static fn loadJson(file: string, path: string = "") { Config.repo.loadJson(file, path); }
+        static fn loadDir(dir: string) -> int { return Config.repo.loadDir(dir); }
+    }
+}
