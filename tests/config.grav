@@ -1,0 +1,176 @@
+// apogee-config's tests: .env parsing and lookup, dotted-path settings and their
+// index, JSON config files with environment placeholders, typed sections.
+import "std"
+import "../src/all.grav"
+use apogee.*
+
+fn tmpDir(tag: string) -> string {
+    let d = "${Dir.temp()}/apogee-config-${tag}-${Process.pid()}";
+    Dir.create(d);
+    return d;
+}
+
+test ".env: bare, quoted, exported, commented and multi-line values" {
+    let text = "# a comment\n" +
+               "APP_NAME=Shop   # trailing comment\n" +
+               "export APP_ENV=testing\n" +
+               "EMPTY=\n" +
+               "SINGLE='literal \${APP_NAME} # not a comment'\n" +
+               "DOUBLE=\"line1\\nline2 \\\"quoted\\\" \\$HOME\"\n" +
+               "MULTI=\"a\n" +
+               "b\"\n" +
+               "HASH=a#b\n" +
+               "DOT.KEY = spaced value\n";
+    let m = Env.parse(text);
+    assertEq(m["APP_NAME"], "Shop");
+    assertEq(m["APP_ENV"], "testing");
+    assertEq(m["EMPTY"], "");
+    assertEq(m["SINGLE"], "literal \${APP_NAME} # not a comment");
+    assertEq(m["DOUBLE"], "line1\nline2 \"quoted\" $HOME");
+    assertEq(m["MULTI"], "a\nb");
+    assertEq(m["HASH"], "a#b");
+    assertEq(m["DOT.KEY"], "spaced value");
+}
+
+test ".env: interpolation, defaults, and errors with line numbers" {
+    let m = Env.parse("HOST=db.local\nPORT=5432\nURL=postgres://\${HOST}:$PORT/app\nMODE=\${UNSET_THING_XYZ:-dev}\n");
+    assertEq(m["URL"], "postgres://db.local:5432/app");
+    assertEq(m["MODE"], "dev");
+    let msg = "";
+    try { Env.parse("OK=1\nnot a line\n", "test.env"); } catch (e: ConfigError) { msg = e.message(); }
+    assertEq(msg, "test.env:2: expected KEY=value");
+    msg = "";
+    try { Env.parse("A=\"open\n", "x.env"); } catch (e: ConfigError) { msg = e.message(); }
+    assertEq(Str.contains(msg, "unterminated"), true);
+}
+
+test "Env: loading files, the real environment winning, typed reads, require" {
+    Env.reset();
+    let d = tmpDir("env");
+    new File(d + "/.env").write("APP_ENV=staging\nFLAG=yes\nCOUNT=42\nRATE=0.25\nLIST=a, b,c\nPATH=/not/the/real/one\n");
+    new File(d + "/.env.staging").write("FLAG=off\n");
+    assertEq(Env.loadAll(d), 7);
+    assertEq(Env.get("APP_ENV"), "staging");
+    assertEq(Env.getBool("FLAG", true), false);                 // .env.staging overrode .env
+    assertEq(Env.getInt("COUNT"), 42 as long);
+    assertEq(Env.getFloat("RATE"), 0.25);
+    assertEq(Str.join(Env.getList("LIST"), "|"), "a|b|c");
+    assertEq(Env.get("PATH") != "/not/the/real/one", true);    // the real environment wins
+    assertEq(Env.has("COUNT"), true);
+    assertEq(Env.has("NOPE_NOT_SET_ANYWHERE"), false);
+    assertEq(Env.get("NOPE_NOT_SET_ANYWHERE", "fallback"), "fallback");
+    let msg = "";
+    try { Env.require(["COUNT", "MISSING_ONE", "MISSING_TWO"]); } catch (e: ConfigError) { msg = e.message(); }
+    assertEq(msg, "missing environment variable(s): MISSING_ONE, MISSING_TWO");
+    Env.reset();
+    Dir.removeAll(d);
+}
+
+test "Config: dotted paths, typed reads, replacing a subtree keeps the index right" {
+    let c = new ConfigRepository();
+    c.set("app.name", "Shop");
+    c.set("app.debug", true);
+    c.set("db.connections.main.port", 5432);
+    assertEq(c.getString("app.name"), "Shop");
+    assertEq(c.getBool("app.debug"), true);
+    assertEq(c.getInt("db.connections.main.port"), 5432 as long);
+    assertEq(c.getMap("db.connections").size(), 1);
+    assertEq(c.has("db.connections.main"), true);
+
+    // Replacing a map drops every path under the old one.
+    let main = new HashMap<string, any>(); main.put("host", "x"); main.put("port", 1);
+    c.set("db.connections", main);
+    assertEq(c.has("db.connections.main.port"), false);
+    assertEq(c.getString("db.connections.host"), "x");
+    // A leaf replaced by a map, and back.
+    c.set("app.name.short", "S");
+    assertEq(c.getString("app.name.short"), "S");
+    c.set("app.name", "Shop");
+    assertEq(c.has("app.name.short"), false);
+
+    c.forget("db");
+    assertEq(c.has("db.connections.host"), false);
+    assertEq(c.has("db"), false);
+    c.push("app.providers", "A");
+    c.push("app.providers", "B");
+    assertEq(Str.join(c.getList("app.providers"), ","), "A,B");
+    assertEq(c.getInt("app.missing", 7), 7 as long);
+    assertEq(c.get("app.missing") == null, true);
+}
+
+test "Config: a caller's map is copied, merge is deep" {
+    let c = new ConfigRepository();
+    let m = new HashMap<string, any>(); m.put("a", 1);
+    c.set("x", m);
+    m.put("b", 2);                                             // not seen through the copy
+    assertEq(c.has("x.b"), false);
+    let over = new HashMap<string, any>();
+    let inner = new HashMap<string, any>(); inner.put("b", 3);
+    over.put("x", inner);
+    over.put("y", "new");
+    c.merge("", over);
+    assertEq("${c.getInt("x.a")} ${c.getInt("x.b")} ${c.getString("y")}", "1 3 new");
+}
+
+test "Config: JSON files with environment placeholders, and back to JSON" {
+    Env.reset();
+    Env.set("SHOP_DEBUG", "true");
+    Env.set("SHOP_PORT", "8080");
+    Env.set("SHOP_HOST", "example.com");
+    let d = tmpDir("json");
+    new File(d + "/app.json").write("{\"name\": \"Shop\", \"debug\": \"\${SHOP_DEBUG}\", \"port\": \"\${SHOP_PORT}\", " +
+        "\"url\": \"https://\${SHOP_HOST}/\", \"mode\": \"\${SHOP_MODE:-dev}\", \"tags\": [\"a\", 2]}");
+    new File(d + "/cache.json").write("{\"ttl\": 300, \"stores\": {\"file\": {\"path\": \"/tmp\"}}}");
+    new File(d + "/notes.txt").write("ignored");
+    let c = new ConfigRepository();
+    assertEq(c.loadDir(d), 2);
+    assertEq(c.get("app.debug") == true, true);                 // typed, not "true"
+    assertEq(c.getInt("app.port"), 8080 as long);
+    assertEq(c.getString("app.url"), "https://example.com/");
+    assertEq(c.getString("app.mode"), "dev");
+    assertEq(c.getString("cache.stores.file.path"), "/tmp");
+    assertEq(c.getList("app.tags").size(), 2);
+    let back = new ConfigRepository();
+    new File(d + "/all.json").write(c.toJson());
+    back.loadJson(d + "/all.json");
+    assertEq(back.getInt("cache.ttl"), 300 as long);
+    assertEq(back.leaves().size(), c.leaves().size());
+    let msg = "";
+    new File(d + "/bad.json").write("{nope");
+    try { c.loadJson(d + "/bad.json"); } catch (e: ConfigError) { msg = e.message(); }
+    assertEq(Str.contains(msg, "not valid JSON"), true);
+    Env.reset();
+    Dir.removeAll(d);
+}
+
+class MailConfig {
+    public host: string = "localhost"
+    public port: int = 25
+    public useTls: bool = false
+    public maxConnections: long = 1
+    public fromName: string? = null
+}
+
+test "Config: typed sections fill fields by name or snake_case" {
+    let c = new ConfigRepository();
+    c.set("mail.host", "smtp.example.com");
+    c.set("mail.port", 587);
+    c.set("mail.use_tls", true);
+    c.set("mail.max_connections", "8");
+    let m = c.section::<MailConfig>("mail");
+    assertEq("${m.host} ${m.port} ${m.useTls} ${m.maxConnections}", "smtp.example.com 587 true 8");
+    assertEq(m.fromName == null, true);                          // no key: default kept
+    let empty = c.section::<MailConfig>("nothing.here");
+    assertEq(empty.port, 25);
+}
+
+test "Config: the facade, and require" {
+    Config.reset();
+    Config.set("app.key", "base64:abc");
+    assertEq(Config.getString("app.key"), "base64:abc");
+    let msg = "";
+    try { Config.require(["app.key", "app.url"]); } catch (e: ConfigError) { msg = e.message(); }
+    assertEq(msg, "missing configuration: app.url");
+    Config.reset();
+    assertEq(Config.has("app.key"), false);
+}
