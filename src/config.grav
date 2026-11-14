@@ -309,6 +309,8 @@ namespace apogee {
         static fn reset() { Config.repo = new ConfigRepository(); }
 
         static fn has(path: string) -> bool { return Config.repo.has(path); }
+        // Every setting, as the nested maps they are kept in.
+        static fn all() -> HashMap<string, any> { return Config.repo.all(); }
         static fn get(path: string, fallback: any = null) -> any { return Config.repo.get(path, fallback); }
         static fn getString(path: string, fallback: string = "") -> string { return Config.repo.getString(path, fallback); }
         static fn getInt(path: string, fallback: long = 0) -> long { return Config.repo.getInt(path, fallback); }
