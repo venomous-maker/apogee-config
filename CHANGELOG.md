@@ -6,6 +6,8 @@ compiler versions it builds with.
 
 ## Unreleased
 
+## 0.1.0 (2026-11-19)
+
 The first tagged release. Needs grav 1.7.0 or newer.
 
 Configuration for [Apogee](https://github.com/venomous-maker) applications: the environment and `.env` files (`Env`), and the application's settings as one tree read by dotted path (`Config`), loaded from JSON files or set in code, with typed sections filled by reflection.
